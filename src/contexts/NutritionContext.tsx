@@ -52,13 +52,21 @@ const UUID_RE =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 /**
- * True only for a well-formed UUID string. Guards the `uuid` columns (`id`,
- * `user_id`) so Postgres never throws 22P02 ("invalid input syntax for type
- * uuid") — which happens with `null`, an empty string, an object, or a stale
- * non-UUID id restored from an old localStorage cache.
+ * True only for a well-formed UUID string. Guards the `user_id` uuid column so
+ * Postgres never throws 22P02 ("invalid input syntax for type uuid") — which
+ * happens with `null`, an empty string, or an object.
  */
 function isUuid(value: unknown): value is string {
   return typeof value === "string" && UUID_RE.test(value.trim());
+}
+
+/**
+ * `daily_logs.id` is a DB-owned integer, so a real row id (and therefore any
+ * valid DELETE target) is always a numeric string — never a UUID.
+ */
+function isNumericId(value: unknown): value is string {
+  if (typeof value !== "string" && typeof value !== "number") return false;
+  return /^\d+$/.test(String(value).trim());
 }
 
 /** Coerces unknown/cached values (strings, numbers) into a finite integer. */
@@ -73,17 +81,35 @@ function isUsablePendingOp(op: unknown): op is PendingOp {
   const candidate = op as PendingOp;
   if (candidate.kind === "insert") {
     const log = candidate.log as DailyLog | undefined;
+    // The insert payload never sends `id` (the DB owns it), so only the fields
+    // that actually reach the table need to be well-formed.
     return (
       !!log &&
       typeof log === "object" &&
-      isUuid(log.id) &&
       typeof log.date === "string" &&
       toInt(log.food_id) !== null &&
       toInt(log.quantity) !== null
     );
   }
-  if (candidate.kind === "delete") return isUuid(candidate.logId);
+  // A delete can only target a real DB id, which is numeric.
+  if (candidate.kind === "delete") return isNumericId(candidate.logId);
   return false;
+}
+
+/**
+ * Drops cached rows whose `id` is not a real numeric DB id — those are stale
+ * optimistic copies from the era when the client supplied UUID ids.
+ */
+function pruneLogsByDate(
+  logsByDate: Record<string, DailyLog[]>
+): Record<string, DailyLog[]> {
+  const pruned: Record<string, DailyLog[]> = {};
+  for (const [date, logs] of Object.entries(logsByDate || {})) {
+    pruned[date] = (Array.isArray(logs) ? logs : []).filter((log) =>
+      isNumericId(log?.id)
+    );
+  }
+  return pruned;
 }
 
 function sortLogs(logs: DailyLog[]) {
@@ -149,15 +175,28 @@ function readCache(userId: string): NutritionCache {
     if (parsed?.version !== CACHE_VERSION || parsed.userId !== userId) {
       return fallback;
     }
+    // Purge stale rows / queued deletes that carry non-numeric `id`s from older
+    // builds (they would be replayed as `id=eq.<uuid>` and 400 on an integer
+    // column), then re-attach inserts that are still pending so an un-synced
+    // entry survives an offline reload.
+    const pending = Array.isArray(parsed.pending)
+      ? parsed.pending.filter(isUsablePendingOp)
+      : [];
+    const logsByDate = pruneLogsByDate(parsed.logsByDate || {});
+
+    for (const op of pending) {
+      if (op.kind !== "insert") continue;
+      const list = logsByDate[op.log.date] || [];
+      if (!list.some((log) => log.id === op.log.id)) {
+        logsByDate[op.log.date] = [...list, op.log];
+      }
+    }
+
     return {
       version: CACHE_VERSION,
       userId,
-      logsByDate: parsed.logsByDate || {},
-      // Drop ops written by older builds that carried malformed ids, so they
-      // can never be replayed into Postgres as invalid uuid values.
-      pending: Array.isArray(parsed.pending)
-        ? parsed.pending.filter(isUsablePendingOp)
-        : [],
+      logsByDate,
+      pending,
     };
   } catch {
     return fallback;
@@ -401,6 +440,13 @@ export function NutritionProvider({ children }: { children: React.ReactNode }) {
               }
             }
           } else {
+            // `id=eq.<uuid>` is rejected by the integer id column with a 400, so
+            // drop stale ops instead of replaying them on every flush.
+            if (!isNumericId(op.logId)) {
+              console.warn("Nutrition delete dropped: non-numeric id", op.logId);
+              continue;
+            }
+
             const { error } = await supabase
               .from("daily_logs")
               .delete()
@@ -500,14 +546,26 @@ export function NutritionProvider({ children }: { children: React.ReactNode }) {
       );
       applyLogs(date, remainingLogs);
 
-      // Keep any in-flight insert, then enqueue delete so the server
-      // still drops the row if the insert already landed.
-      pendingRef.current = [
-        ...pendingRef.current.filter(
-          (op) => !(op.kind === "delete" && op.logId === logId)
-        ),
-        { kind: "delete", logId },
-      ];
+      // Cancel any queued insert for this entry — its client id will never
+      // match a server row, so keeping it would resurrect the entry.
+      const withoutInserts = pendingRef.current.filter(
+        (op) => !(op.kind === "insert" && op.log.id === logId)
+      );
+
+      if (isNumericId(logId)) {
+        // Real DB id: enqueue a server delete so it drops the row too.
+        pendingRef.current = [
+          ...withoutInserts.filter(
+            (op) => !(op.kind === "delete" && op.logId === logId)
+          ),
+          { kind: "delete", logId },
+        ];
+      } else {
+        // Local-only id (never synced): removing it locally is enough — a
+        // delete query with a non-numeric id would 400 on the integer column.
+        pendingRef.current = withoutInserts;
+      }
+
       persist();
       void flushPending();
     },
