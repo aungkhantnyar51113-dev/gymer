@@ -15,10 +15,6 @@ import type { DailyLog, DailyTotals, FoodItem } from "@/lib/types";
 
 const HISTORY_DAYS = 14;
 
-// Fallback owner used when the app runs without authentication,
-// matching the single-user mode in NutritionContext.
-const SINGLE_USER_ID = "00000000-0000-0000-0000-000000000000";
-
 type MacroMeta = {
   label: string;
   target: number;
@@ -137,7 +133,8 @@ async function fetchHistory(
         return {
           id: String(row.id),
           user_id: String(row.user_id),
-          date,
+          // Prefer `date`, fall back to `logged_date` (both exist on the table).
+          date: String(row.date ?? row.logged_date ?? date),
           food_id: foodId,
           quantity: Number(row.quantity) || 0,
           created_at: String(row.created_at),
@@ -158,7 +155,8 @@ async function fetchHistory(
 
 export function HistoryLog() {
   const { user } = useAuth();
-  const userId = user?.id || SINGLE_USER_ID;
+  // `null` until the session resolves; queries below are gated on a real id.
+  const userId = user?.id ?? null;
 
   const [days, setDays] = useState<DaySummary[]>([]);
   const [status, setStatus] = useState<"loading" | "ready" | "error">(
@@ -168,7 +166,8 @@ export function HistoryLog() {
   const [reloadKey, setReloadKey] = useState(0);
 
   useEffect(() => {
-    if (!isSupabaseConfigured || !supabase) return;
+    // No query — not even a SELECT — until a real authenticated user exists.
+    if (!isSupabaseConfigured || !supabase || !userId) return;
 
     const client = supabase;
     let active = true;

@@ -18,12 +18,10 @@ const DAILY_MISSIONS: Mission[] = [
   { id: "sleep", title: "Eat 100g protein per day", hint: "Recovery" },
 ];
 
-// Fallback owner when the app is used without authentication (single-user mode).
-const SINGLE_USER_ID = "00000000-0000-0000-0000-000000000000";
-
 export default function Home() {
   const { user } = useAuth();
-  const userId = user?.id || SINGLE_USER_ID;
+  // `null` until the session resolves; the placeholder UUID is never used.
+  const userId = user?.id ?? null;
 
   // Single source of truth for mission completion. Lifted here so the
   // "Today Exercises" ring and the "Daily Mission" list stay in sync.
@@ -33,7 +31,7 @@ export default function Home() {
 
   // Load today's saved missions whenever the owner changes (mount / sign-in).
   useEffect(() => {
-    if (!isSupabaseConfigured || !supabase) return;
+    if (!isSupabaseConfigured || !supabase || !userId) return;
 
     const client = supabase;
     let active = true;
@@ -86,7 +84,7 @@ export default function Home() {
         return next;
       });
 
-      if (!isSupabaseConfigured || !supabase) return;
+      if (!isSupabaseConfigured || !supabase || !userId) return;
 
       const { error } = await supabase.from("user_missions").upsert(
         {

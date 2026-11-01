@@ -40,9 +40,13 @@ const NutritionContext = createContext<NutritionContextType | undefined>(
   undefined
 );
 
-const SINGLE_USER_ID = "00000000-0000-0000-0000-000000000000";
 const CACHE_PREFIX = "gymer:nutrition:";
 const CACHE_VERSION = 1 as const;
+
+// Namespace for the local-only cache used when nobody is signed in. It is never
+// sent to the database — remote reads/writes are skipped entirely without a
+// real, authenticated user id.
+const ANON_CACHE_ID = "anonymous";
 
 function sortLogs(logs: DailyLog[]) {
   return [...logs].sort((a, b) => {
@@ -168,7 +172,8 @@ function mapFoodsToLogs(
     return {
       id: String(row.id),
       user_id: String(row.user_id),
-      date: String(row.date),
+      // The table carries both `date` and `logged_date`; prefer whichever is set.
+      date: String(row.date ?? row.logged_date ?? ""),
       food_id: foodId,
       quantity: Number(row.quantity) || 0,
       created_at: String(row.created_at),
@@ -179,7 +184,9 @@ function mapFoodsToLogs(
 
 export function NutritionProvider({ children }: { children: React.ReactNode }) {
   const { user, loading: authLoading } = useAuth();
-  const userId = user?.id || SINGLE_USER_ID;
+  // `null` until the session resolves. Remote queries are gated on this being a
+  // real id — the placeholder/zero UUID is never used.
+  const userId = user?.id ?? null;
 
   const [currentDate, setCurrentDate] = useState(getTodayKey);
   const [dailyLogs, setDailyLogs] = useState<DailyLog[]>([]);
@@ -187,7 +194,7 @@ export function NutritionProvider({ children }: { children: React.ReactNode }) {
 
   const logsByDateRef = useRef<Record<string, DailyLog[]>>({});
   const pendingRef = useRef<PendingOp[]>([]);
-  const userIdRef = useRef(userId);
+  const userIdRef = useRef<string | null>(userId);
   const currentDateRef = useRef(currentDate);
   const flushingRef = useRef(false);
   const mountedRef = useRef(true);
@@ -201,7 +208,7 @@ export function NutritionProvider({ children }: { children: React.ReactNode }) {
   const persist = useCallback(() => {
     writeCache({
       version: CACHE_VERSION,
-      userId: userIdRef.current,
+      userId: userIdRef.current ?? ANON_CACHE_ID,
       logsByDate: logsByDateRef.current,
       pending: pendingRef.current,
     });
@@ -224,7 +231,7 @@ export function NutritionProvider({ children }: { children: React.ReactNode }) {
 
   const hydrateFromCache = useCallback(
     (date: string) => {
-      const cache = readCache(userIdRef.current);
+      const cache = readCache(userIdRef.current ?? ANON_CACHE_ID);
       logsByDateRef.current = cache.logsByDate;
       pendingRef.current = cache.pending;
       applyLogs(date, cache.logsByDate[date] || [], false);
@@ -235,12 +242,16 @@ export function NutritionProvider({ children }: { children: React.ReactNode }) {
   const fetchRemoteLogs = useCallback(async (date: string): Promise<DailyLog[] | null> => {
     if (!isSupabaseConfigured || !supabase) return null;
 
+    // Hard gate: no SELECT until a real authenticated user id is available.
+    const currentUserId = userIdRef.current;
+    if (!currentUserId) return null;
+
     try {
       const { data, error } = await supabase
         .from("daily_logs")
         .select("*")
         .eq("date", date)
-        .eq("user_id", userIdRef.current)
+        .eq("user_id", currentUserId)
         .order("created_at", { ascending: false });
 
       if (error) {
@@ -291,6 +302,9 @@ export function NutritionProvider({ children }: { children: React.ReactNode }) {
     // Never push writes while the session is still resolving, otherwise rows
     // would be stamped with the placeholder id and rejected by RLS.
     if (authLoading) return;
+    // Hard gate: never INSERT/DELETE without a real authenticated user id.
+    const currentUserId = userIdRef.current;
+    if (!currentUserId) return;
     if (flushingRef.current || pendingRef.current.length === 0) return;
 
     flushingRef.current = true;
@@ -303,9 +317,11 @@ export function NutritionProvider({ children }: { children: React.ReactNode }) {
           if (op.kind === "insert") {
             const { error } = await supabase.from("daily_logs").insert({
               id: op.log.id,
-              // Re-stamp with the identity that is current at write time.
-              user_id: userIdRef.current,
+              user_id: currentUserId,
+              // `daily_logs` has both columns; populate them with the same
+              // local `YYYY-MM-DD` so neither is left null.
               date: op.log.date,
+              logged_date: op.log.date,
               food_id: op.log.food_id,
               quantity: op.log.quantity,
               created_at: op.log.created_at,
@@ -325,7 +341,7 @@ export function NutritionProvider({ children }: { children: React.ReactNode }) {
               .from("daily_logs")
               .delete()
               .eq("id", op.logId)
-              .eq("user_id", userIdRef.current);
+              .eq("user_id", currentUserId);
 
             if (error) remaining.push(op);
           }
@@ -381,7 +397,8 @@ export function NutritionProvider({ children }: { children: React.ReactNode }) {
       const today = getTodayKey();
       const optimistic: DailyLog = {
         id: crypto.randomUUID(),
-        user_id: userIdRef.current,
+        // Local-only placeholder owner; the real id is stamped at write time.
+        user_id: userIdRef.current ?? ANON_CACHE_ID,
         date: today,
         food_id: food.id,
         quantity: Number(quantity) || 1,
