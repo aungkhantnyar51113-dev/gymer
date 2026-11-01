@@ -178,7 +178,7 @@ function mapFoodsToLogs(
 }
 
 export function NutritionProvider({ children }: { children: React.ReactNode }) {
-  const { user } = useAuth();
+  const { user, loading: authLoading } = useAuth();
   const userId = user?.id || SINGLE_USER_ID;
 
   const [currentDate, setCurrentDate] = useState(getTodayKey);
@@ -288,6 +288,9 @@ export function NutritionProvider({ children }: { children: React.ReactNode }) {
 
   const flushPending = useCallback(async () => {
     if (!isSupabaseConfigured || !supabase) return;
+    // Never push writes while the session is still resolving, otherwise rows
+    // would be stamped with the placeholder id and rejected by RLS.
+    if (authLoading) return;
     if (flushingRef.current || pendingRef.current.length === 0) return;
 
     flushingRef.current = true;
@@ -300,7 +303,8 @@ export function NutritionProvider({ children }: { children: React.ReactNode }) {
           if (op.kind === "insert") {
             const { error } = await supabase.from("daily_logs").insert({
               id: op.log.id,
-              user_id: op.log.user_id,
+              // Re-stamp with the identity that is current at write time.
+              user_id: userIdRef.current,
               date: op.log.date,
               food_id: op.log.food_id,
               quantity: op.log.quantity,
@@ -312,6 +316,7 @@ export function NutritionProvider({ children }: { children: React.ReactNode }) {
                 error.code === "23505" ||
                 error.message?.toLowerCase().includes("duplicate");
               if (!duplicate) {
+                console.warn("Nutrition write queued for retry:", error.message);
                 remaining.push(op);
               }
             }
@@ -342,7 +347,7 @@ export function NutritionProvider({ children }: { children: React.ReactNode }) {
     } finally {
       flushingRef.current = false;
     }
-  }, [persist]);
+  }, [authLoading, persist]);
 
   const getLogsByDate = useCallback(
     async (date: string) => {
@@ -392,9 +397,12 @@ export function NutritionProvider({ children }: { children: React.ReactNode }) {
       pendingRef.current = [...pendingRef.current, { kind: "insert", log: optimistic }];
       persist();
 
-      void flushPending();
+      // Write straight through to Supabase, then re-read from it so the server
+      // row (not just the optimistic/local copy) is the source of truth.
+      await flushPending();
+      await getTodayLogs();
     },
-    [applyLogs, flushPending, persist]
+    [applyLogs, flushPending, getTodayLogs, persist]
   );
 
   const deleteFoodLog = useCallback(
@@ -425,6 +433,11 @@ export function NutritionProvider({ children }: { children: React.ReactNode }) {
   );
 
   useEffect(() => {
+    // Wait for the session lookup to settle before touching the database, so
+    // the first read (and any write) always uses the resolved user id instead
+    // of the single-user placeholder.
+    if (authLoading) return;
+
     mountedRef.current = true;
     hydrateFromCache(getTodayKey());
     // Intentional fetch-on-mount; toggling loading state here is by design.
@@ -448,7 +461,7 @@ export function NutritionProvider({ children }: { children: React.ReactNode }) {
       window.removeEventListener("online", retry);
       document.removeEventListener("visibilitychange", onVisible);
     };
-  }, [userId, flushPending, getLogsByDate, getTodayLogs, hydrateFromCache]);
+  }, [userId, authLoading, flushPending, getLogsByDate, getTodayLogs, hydrateFromCache]);
 
   return (
     <NutritionContext.Provider
