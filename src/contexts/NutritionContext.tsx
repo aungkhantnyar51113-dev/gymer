@@ -48,6 +48,44 @@ const CACHE_VERSION = 1 as const;
 // real, authenticated user id.
 const ANON_CACHE_ID = "anonymous";
 
+const UUID_RE =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/**
+ * True only for a well-formed UUID string. Guards the `uuid` columns (`id`,
+ * `user_id`) so Postgres never throws 22P02 ("invalid input syntax for type
+ * uuid") — which happens with `null`, an empty string, an object, or a stale
+ * non-UUID id restored from an old localStorage cache.
+ */
+function isUuid(value: unknown): value is string {
+  return typeof value === "string" && UUID_RE.test(value.trim());
+}
+
+/** Coerces unknown/cached values (strings, numbers) into a finite integer. */
+function toInt(value: unknown): number | null {
+  const n = typeof value === "number" ? value : Number(value);
+  return Number.isFinite(n) ? Math.trunc(n) : null;
+}
+
+/** Rejects corrupted pending ops (bad ids / non-numeric fields) from old caches. */
+function isUsablePendingOp(op: unknown): op is PendingOp {
+  if (!op || typeof op !== "object") return false;
+  const candidate = op as PendingOp;
+  if (candidate.kind === "insert") {
+    const log = candidate.log as DailyLog | undefined;
+    return (
+      !!log &&
+      typeof log === "object" &&
+      isUuid(log.id) &&
+      typeof log.date === "string" &&
+      toInt(log.food_id) !== null &&
+      toInt(log.quantity) !== null
+    );
+  }
+  if (candidate.kind === "delete") return isUuid(candidate.logId);
+  return false;
+}
+
 function sortLogs(logs: DailyLog[]) {
   return [...logs].sort((a, b) => {
     const aTime = new Date(a.created_at).getTime();
@@ -115,7 +153,11 @@ function readCache(userId: string): NutritionCache {
       version: CACHE_VERSION,
       userId,
       logsByDate: parsed.logsByDate || {},
-      pending: Array.isArray(parsed.pending) ? parsed.pending : [],
+      // Drop ops written by older builds that carried malformed ids, so they
+      // can never be replayed into Postgres as invalid uuid values.
+      pending: Array.isArray(parsed.pending)
+        ? parsed.pending.filter(isUsablePendingOp)
+        : [],
     };
   } catch {
     return fallback;
@@ -302,9 +344,11 @@ export function NutritionProvider({ children }: { children: React.ReactNode }) {
     // Never push writes while the session is still resolving, otherwise rows
     // would be stamped with the placeholder id and rejected by RLS.
     if (authLoading) return;
-    // Hard gate: never INSERT/DELETE without a real authenticated user id.
-    const currentUserId = userIdRef.current;
-    if (!currentUserId) return;
+    // Hard gate: never INSERT/DELETE without a real authenticated user id, and
+    // never pass a malformed one — Postgres would reject it with 22P02.
+    const currentUserId =
+      typeof userIdRef.current === "string" ? userIdRef.current.trim() : "";
+    if (!isUuid(currentUserId)) return;
     if (flushingRef.current || pendingRef.current.length === 0) return;
 
     flushingRef.current = true;
@@ -315,15 +359,35 @@ export function NutritionProvider({ children }: { children: React.ReactNode }) {
       for (const op of pendingRef.current) {
         try {
           if (op.kind === "insert") {
+            const foodId = toInt(op.log.food_id);
+            const quantity = toInt(op.log.quantity);
+            const loggedDate = String(op.log.date ?? "").trim();
+
+            // A non-numeric macro can never succeed, so drop it instead of
+            // replaying it on every flush.
+            if (foodId === null || quantity === null || !loggedDate) {
+              console.warn("Nutrition write dropped: invalid payload", {
+                foodId,
+                quantity,
+                loggedDate,
+              });
+              continue;
+            }
+
+            // Column mapping (verified against the live schema):
+            //   user_id     -> uuid   -> session user id
+            //   food_id     -> integer -> foods.id
+            //   quantity    -> integer
+            //   date / logged_date -> text/date -> local "YYYY-MM-DD"
+            // `daily_logs.id` is DB-owned (uuid default or serial), so it is
+            // deliberately NOT sent — passing the client UUID here is exactly
+            // what threw `invalid input syntax for type integer`.
             const { error } = await supabase.from("daily_logs").insert({
-              id: op.log.id,
               user_id: currentUserId,
-              // `daily_logs` has both columns; populate them with the same
-              // local `YYYY-MM-DD` so neither is left null.
-              date: op.log.date,
-              logged_date: op.log.date,
-              food_id: op.log.food_id,
-              quantity: op.log.quantity,
+              date: loggedDate,
+              logged_date: loggedDate,
+              food_id: foodId,
+              quantity,
               created_at: op.log.created_at,
             });
 
@@ -378,7 +442,11 @@ export function NutritionProvider({ children }: { children: React.ReactNode }) {
       if (!mountedRef.current) return;
 
       if (remote) {
-        const merged = mergeLogs(remote, logsByDateRef.current[date] || [], pendingRef.current);
+        // The server owns the primary key, so local optimistic copies (which
+        // carry client-generated ids) must not be carried over — otherwise the
+        // freshly inserted row would appear twice. Only rows still awaiting a
+        // flush (`pending`) are merged on top of the server result.
+        const merged = mergeLogs(remote, [], pendingRef.current);
         applyLogs(date, merged);
         void flushPending();
       }
@@ -396,12 +464,14 @@ export function NutritionProvider({ children }: { children: React.ReactNode }) {
     async (food: FoodItem, quantity: number) => {
       const today = getTodayKey();
       const optimistic: DailyLog = {
+        // Always a real UUID so it satisfies the `id` uuid column on insert.
         id: crypto.randomUUID(),
         // Local-only placeholder owner; the real id is stamped at write time.
         user_id: userIdRef.current ?? ANON_CACHE_ID,
         date: today,
-        food_id: food.id,
-        quantity: Number(quantity) || 1,
+        // Integer columns — never send fractional/NaN values.
+        food_id: toInt(food.id) ?? 0,
+        quantity: toInt(quantity) ?? 1,
         created_at: new Date().toISOString(),
         food,
       };
